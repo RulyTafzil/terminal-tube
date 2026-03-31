@@ -88,7 +88,7 @@ def get_authenticated_service():
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
 
-    return build("youtube", "v3", credentials=creds)
+    return build("youtube", "v3", credentials=creds), creds
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def extract_video_id(input_str: str) -> str:
@@ -283,9 +283,16 @@ class YTLiveChatApp(App[None]):
         chat_id: str,
         video_title: str,
         channel: str,
+        creds,
     ) -> None:
         super().__init__()
-        self.youtube     = youtube
+        # polling Instance  
+        self.poll_youtube = youtube
+
+        #sending instance   
+        self.send_youtube = build("youtube", "v3", credentials=creds)
+
+        #self.youtube     = youtube
         self.chat_id     = chat_id
         self.video_title = video_title
         self.channel     = channel
@@ -340,7 +347,7 @@ class YTLiveChatApp(App[None]):
                 if page_token:
                     kwargs["pageToken"] = page_token
 
-                resp       = self.youtube.liveChatMessages().list(**kwargs).execute()
+                resp       = self.poll_youtube.liveChatMessages().list(**kwargs).execute()
                 items      = resp.get("items", [])
                 poll_ms    = resp.get("pollingIntervalMillis", POLL_INTERVAL_MS)
                 page_token = resp.get("nextPageToken")
@@ -393,7 +400,7 @@ class YTLiveChatApp(App[None]):
 
     @work(thread=True)
     def _send_message_worker(self, msg: str) -> None:
-        ok, err = send_message(self.youtube, self.chat_id, msg)
+        ok, err = send_message(self.send_youtube, self.chat_id, msg)
         if not ok:
             self.call_from_thread(
                 self._write, Text(f"Send failed: {err}", style="bold red")
@@ -407,7 +414,7 @@ def main() -> None:
     video_id = extract_video_id(args.video)
 
     _console.print("\n[bold]🔐 Authenticating with YouTube…[/bold]")
-    youtube = get_authenticated_service()
+    youtube, creds = get_authenticated_service()
 
     _console.print(f"[bold]🔍 Looking up live chat for [cyan]{video_id}[/cyan]…[/bold]")
     chat_id, video_title, channel = get_live_chat_id(youtube, video_id)
@@ -417,7 +424,7 @@ def main() -> None:
     )
     time.sleep(0.5)   # let the user read the confirmation before TUI takes over
 
-    YTLiveChatApp(youtube, chat_id, video_title, channel).run()
+    YTLiveChatApp(youtube, chat_id, video_title, channel, creds).run()
 
 
 if __name__ == "__main__":
