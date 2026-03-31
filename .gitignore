@@ -1,3 +1,5 @@
 .venv
 client_secrets.json
 yt_token.json
+target
+Cargo.lock
