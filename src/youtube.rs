@@ -27,11 +27,36 @@ impl YouTube {
         Ok(headers)
     }
 
+    async fn json_or_error<T: for<'de> Deserialize<'de>>(
+        &self,
+        resp: reqwest::Response,
+        context_label: &'static str,
+    ) -> Result<T> {
+        let status = resp.status();
+        if status.is_success() {
+            return resp
+                .json::<T>()
+                .await
+                .with_context(|| format!("parse {context_label} response json"));
+        }
+
+        let body = resp
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read response body>".to_string());
+
+        Err(anyhow!(
+            "{context_label} failed: HTTP {} body: {}",
+            status.as_u16(),
+            body
+        ))
+    }
+
     pub async fn get_live_chat_id(&self, video_id: &str) -> Result<(String, String, String)> {
         let url = "https://www.googleapis.com/youtube/v3/videos";
         let headers = self.auth_headers().await?;
 
-        let resp: VideosListResponse = self
+        let resp = self
             .http
             .get(url)
             .headers(headers)
@@ -41,12 +66,9 @@ impl YouTube {
             ])
             .send()
             .await
-            .context("videos.list request")?
-            .error_for_status()
-            .context("videos.list response status")?
-            .json()
-            .await
-            .context("parse videos.list response")?;
+            .context("videos.list request")?;
+
+        let resp: VideosListResponse = self.json_or_error(resp, "videos.list").await?;
 
         let item = resp.items.into_iter().next().ok_or_else(|| {
             anyhow!("Video not found: {video_id}")
@@ -88,12 +110,11 @@ impl YouTube {
             .query(&q)
             .send()
             .await
-            .context("liveChatMessages.list request")?
-            .error_for_status()
-            .context("liveChatMessages.list response status")?
-            .json::<LiveChatListResponse>()
-            .await
-            .context("parse liveChatMessages.list response")?;
+            .context("liveChatMessages.list request")?;
+
+        let resp: LiveChatListResponse = self
+            .json_or_error(resp, "liveChatMessages.list")
+            .await?;
 
         Ok(resp)
     }
@@ -112,15 +133,18 @@ impl YouTube {
             },
         };
 
-        self.http
+        let resp = self
+            .http
             .post(url)
             .headers(headers)
             .json(&body)
             .send()
             .await
-            .context("liveChatMessages.insert request")?
-            .error_for_status()
-            .context("liveChatMessages.insert response status")?;
+            .context("liveChatMessages.insert request")?;
+
+        let _ignored: serde_json::Value = self
+            .json_or_error(resp, "liveChatMessages.insert")
+            .await?;
 
         Ok(())
     }
@@ -171,8 +195,6 @@ pub struct LiveChatMessage {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct LiveChatSnippet {
-    #[serde(rename = "publishedAt")]
-    pub published_at: Option<String>,
     #[serde(rename = "displayMessage")]
     pub display_message: Option<String>,
     #[serde(rename = "type")]

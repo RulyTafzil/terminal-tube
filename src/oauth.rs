@@ -65,6 +65,41 @@ async fn refresh_token(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthorizedUserTokenFile {
+    pub token: String,
+    pub refresh_token: Option<String>,
+    pub token_uri: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scopes: Vec<String>,
+    pub expiry: Option<String>,
+}
+
+impl AuthorizedUserTokenFile {
+    fn to_stored_token(&self) -> StoredToken {
+        StoredToken {
+            access_token: self.token.clone(),
+            refresh_token: self.refresh_token.clone(),
+            expires_at_utc: self
+                .expiry
+                .as_deref()
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.with_timezone(&Utc)),
+        }
+    }
+
+    fn oauth_client(&self) -> Result<BasicClient> {
+        Ok(BasicClient::new(
+            ClientId::new(self.client_id.clone()),
+            Some(ClientSecret::new(self.client_secret.clone())),
+            AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())
+                .context("invalid auth url")?,
+            Some(TokenUrl::new(self.token_uri.clone()).context("invalid token url")?),
+        ))
+    }
+}
+
 async fn first_time_authorize(
     client: &BasicClient,
     scope: &str,
@@ -171,67 +206,12 @@ fn wait_for_auth_code(listener: &TcpListener, timeout: Duration) -> Result<Strin
     }
 }
 
-fn oauth_client_from_secrets(secrets_path: &Path) -> Result<BasicClient> {
-    let data = std::fs::read_to_string(secrets_path)
-        .with_context(|| format!("read {}", secrets_path.display()))?;
-    let secrets: ClientSecretsFile =
-        serde_json::from_str(&data).context("parse client_secrets.json")?;
-
-    Ok(BasicClient::new(
-        ClientId::new(secrets.installed.client_id),
-        Some(ClientSecret::new(secrets.installed.client_secret)),
-        AuthUrl::new(secrets.installed.auth_uri).context("invalid auth_uri")?,
-        Some(TokenUrl::new(secrets.installed.token_uri).context("invalid token_uri")?),
-    ))
-}
-
-pub async fn get_token_installed_app(
-    client_secrets_path: &Path,
-    token_path: &Path,
-    scope: &str,
-) -> Result<StoredToken> {
-    if !client_secrets_path.exists() {
-        return Err(anyhow!(
-            "`{}` not found (download an OAuth Desktop client JSON from Google Cloud)",
-            client_secrets_path.display()
-        ));
-    }
-
-    let client = oauth_client_from_secrets(client_secrets_path)?;
-
-    // Load token if present.
-    if token_path.exists() {
-        let txt = std::fs::read_to_string(token_path)
-            .with_context(|| format!("read {}", token_path.display()))?;
-        if let Ok(tok) = serde_json::from_str::<TokenFile>(&txt) {
-            let mut tok = tok.into_stored_token();
-            if let Some(rt) = tok.refresh_token.clone() {
-                if tok.is_expired_soon() {
-                    tok = refresh_token(&client, &rt).await?;
-                    let _ = std::fs::write(
-                        token_path,
-                        serde_json::to_string_pretty(&tok).unwrap_or_default(),
-                    );
-                }
-            }
-            return Ok(tok);
-        }
-    }
-
-    let tok = first_time_authorize(&client, scope).await?;
-    std::fs::write(
-        token_path,
-        serde_json::to_string_pretty(&tok).context("serialize token")?,
-    )
-    .with_context(|| format!("write {}", token_path.display()))?;
-    Ok(tok)
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum TokenFile {
     Stored(StoredToken),
     GoogleAuthorizedUser(GoogleAuthorizedUserToken),
+    AuthorizedUser(AuthorizedUserTokenFile),
 }
 
 impl TokenFile {
@@ -246,6 +226,7 @@ impl TokenFile {
                     .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                     .map(|dt| dt.with_timezone(&Utc)),
             },
+            TokenFile::AuthorizedUser(a) => a.to_stored_token(),
         }
     }
 }
@@ -255,5 +236,113 @@ struct GoogleAuthorizedUserToken {
     token: String,
     refresh_token: Option<String>,
     expiry: Option<String>,
+}
+
+fn read_token_file(token_path: &Path) -> Result<TokenFile> {
+    let txt = std::fs::read_to_string(token_path)
+        .with_context(|| format!("read {}", token_path.display()))?;
+    serde_json::from_str::<TokenFile>(&txt).context("parse token file json")
+}
+
+fn write_authorized_user_file(token_path: &Path, file: &AuthorizedUserTokenFile) -> Result<()> {
+    if let Some(parent) = token_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create {}", parent.display()))?;
+    }
+    std::fs::write(
+        token_path,
+        serde_json::to_string_pretty(file).context("serialize token file")?,
+    )
+    .with_context(|| format!("write {}", token_path.display()))?;
+    Ok(())
+}
+
+pub async fn login_with_client_secrets(
+    client_secrets_path: &Path,
+    token_path: &Path,
+    scope: &str,
+) -> Result<()> {
+    if !client_secrets_path.exists() {
+        return Err(anyhow!(
+            "`{}` not found (download an OAuth Desktop client JSON from Google Cloud)",
+            client_secrets_path.display()
+        ));
+    }
+
+    let data = std::fs::read_to_string(client_secrets_path)
+        .with_context(|| format!("read {}", client_secrets_path.display()))?;
+    let secrets: ClientSecretsFile =
+        serde_json::from_str(&data).context("parse client_secrets.json")?;
+
+    let base_client = BasicClient::new(
+        ClientId::new(secrets.installed.client_id.clone()),
+        Some(ClientSecret::new(secrets.installed.client_secret.clone())),
+        AuthUrl::new(secrets.installed.auth_uri).context("invalid auth_uri")?,
+        Some(TokenUrl::new(secrets.installed.token_uri.clone()).context("invalid token_uri")?),
+    );
+
+    let tok = first_time_authorize(&base_client, scope).await?;
+
+    let expiry = tok
+        .expires_at_utc
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+    let file = AuthorizedUserTokenFile {
+        token: tok.access_token,
+        refresh_token: tok.refresh_token,
+        token_uri: secrets.installed.token_uri,
+        client_id: secrets.installed.client_id,
+        client_secret: secrets.installed.client_secret,
+        scopes: vec![scope.to_string()],
+        expiry,
+    };
+
+    write_authorized_user_file(token_path, &file)?;
+    Ok(())
+}
+
+pub async fn get_valid_access_token(
+    token_path: &Path,
+    scope: &str,
+) -> Result<StoredToken> {
+    if !token_path.exists() {
+        return Err(anyhow!(
+            "No token found at `{}`. Run `terminal-tube login ...` first.",
+            token_path.display()
+        ));
+    }
+
+    let tf = read_token_file(token_path)?;
+    match tf {
+        TokenFile::AuthorizedUser(mut f) => {
+            // Basic sanity: scope match (we only store one scope currently).
+            if !f.scopes.iter().any(|s| s == scope) {
+                return Err(anyhow!(
+                    "Token file scopes do not include required scope `{}`. Re-run login.",
+                    scope
+                ));
+            }
+
+            let mut tok = f.to_stored_token();
+            if tok.is_expired_soon() {
+                let rt = tok
+                    .refresh_token
+                    .clone()
+                    .ok_or_else(|| anyhow!("Token has no refresh_token; re-run login"))?;
+                let client = f.oauth_client()?;
+                let new_tok = refresh_token(&client, &rt).await?;
+                f.token = new_tok.access_token.clone();
+                f.refresh_token = new_tok.refresh_token.clone();
+                f.expiry = new_tok
+                    .expires_at_utc
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+                write_authorized_user_file(token_path, &f)?;
+                tok = new_tok;
+            }
+            Ok(tok)
+        }
+        // Back-compat: old formats can be used, but cannot be refreshed without secrets.
+        other => Ok(other.into_stored_token()),
+    }
 }
 
