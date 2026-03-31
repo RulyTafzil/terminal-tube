@@ -269,7 +269,7 @@ class YTLiveChatApp(App[None]):
     }
 
     #msg-input:focus {
-        border: tall #cc0000;
+        border: $secondary;
     }
     """
 
